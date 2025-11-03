@@ -1,0 +1,43 @@
+name: Universal Pylint Code Quality Check
+
+on:
+  workflow_call:   # <-- allows other repos to call this workflow
+    inputs:
+      min_score:
+        description: "Minimum allowed Pylint score"
+        default: "8.0"
+        required: false
+        type: string
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install pylint
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: Run Pylint and check score
+      run: |
+        echo "Running Pylint..."
+        pylint_output=$(pylint $(git ls-files '*.py') || true)
+        echo "$pylint_output"
+        score=$(echo "$pylint_output" | grep "Your code has been rated" | awk '{print $7}' | cut -d'/' -f1)
+        echo "Detected score: $score"
+        if (( $(echo "$score < ${{ inputs.min_score }}" | bc -l) )); then
+          echo "❌ Pylint score $score < ${{ inputs.min_score }}"
+          exit 1
+        else
+          echo "✅ Pylint score OK ($score)"
+        fi
