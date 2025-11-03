@@ -27,57 +27,69 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pylint
+          pip install pylint jq bc
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run Pylint and save report
         id: run_pylint
         run: |
           echo "Running Pylint..."
-          # file that will contain the full report
           REPORT_FILE="pylint_report.txt"
-          # run pylint on tracked python files, save full output
           files=$(git ls-files '*.py' || true)
           if [ -z "$files" ]; then
             echo "No Python files found to lint." | tee "$REPORT_FILE"
             echo "score=0" >> $GITHUB_OUTPUT
+            jq -n --arg m "Pylint" --arg msg "0/10" --arg c "red" '{schemaVersion:1, label:$m, message:$msg, color:$c}' > pylint_score.json
             exit 0
           fi
 
+          # run pylint and capture full output
           pylint $files | tee "$REPORT_FILE" || true
 
-          # append metadata
           echo "" >> "$REPORT_FILE"
           echo "--------------------------------------" >> "$REPORT_FILE"
           echo "Report generated on: $(date --utc)" >> "$REPORT_FILE"
 
-          # parse the final score
+          # parse the final score: "Your code has been rated at 9.47/10"
           score_line=$(grep -E "Your code has been rated" "$REPORT_FILE" || true)
           if [ -n "$score_line" ]; then
             score=$(echo "$score_line" | awk '{print $7}' | cut -d'/' -f1)
           else
             score="0"
           fi
+
+          # Ensure numeric format (fallback to 0)
+          if ! echo "$score" | grep -E '^[0-9]+([.][0-9]+)?$' > /dev/null; then
+            score="0"
+          fi
+
           echo "Detected score: $score"
           echo "score=$score" >> $GITHUB_OUTPUT
-
-          # prepare a Shields-compatible JSON for dynamic badge
-          # schemaVersion 1, label "Pylint", message "<score>/10"
-          jq -n --arg m "Pylint" --arg msg "${score}/10" '{schemaVersion:1, label:$m, message:$msg, color:"brightgreen"}' > pylint_score.json
-
-          # append score to report
           echo "Score: $score" >> "$REPORT_FILE"
+
+          # compute badge color: red <7.0, orange 7.0-8.49, brightgreen 8.5+
+          if (( $(echo "$score < 7.0" | bc -l) )); then
+            color="red"
+          elif (( $(echo "$score < 8.5" | bc -l) )); then
+            color="orange"
+          else
+            color="brightgreen"
+          fi
+
+          # Build Shields-compatible JSON
+          jq -n --arg m "Pylint" --arg msg "${score}/10" --arg c "$color" \
+            '{schemaVersion:1, label:$m, message:$msg, color:$c}' > pylint_score.json
 
           # fail if below threshold
           if (( $(echo "$score < ${{ inputs.min_score }}" | bc -l) )); then
             echo "❌ Pylint score $score < ${{ inputs.min_score }}" | tee -a "$REPORT_FILE"
-            # still upload the report but exit non-zero to mark workflow failed
+            # still upload artifacts below, but set exit code non-zero
             exit 1
           else
             echo "✅ Pylint score OK ($score)" | tee -a "$REPORT_FILE"
           fi
 
-      - name: Upload report as artifact
+      - name: Upload report and json as artifact
         uses: actions/upload-artifact@v4
         with:
           name: pylint-report
@@ -86,20 +98,18 @@ jobs:
             pylint_score.json
 
       - name: Commit pylint_score.json back to repository (optional)
-        # this will only succeed if the runner has write permission (see caller workflow permissions)
         run: |
-          # configure git user for commits
+          # configure git user
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # add or update pylint_score.json
-          if git ls-files --error-unmatch pylint_score.json > /dev/null 2>&1; then
-            git add pylint_score.json
-          else
-            git add pylint_score.json
-          fi
+          # stage file (will create or update)
+          git add pylint_score.json
 
-          # commit (if no changes, commit exits non-zero; ignore that)
+          # commit if changes (ignore if nothing to commit)
           git commit -m "chore(ci): update pylint_score.json [skip ci]" || echo "No changes to commit"
-          # push back to the same branch; if GITHUB_TOKEN lacks rights or it's a PR from fork, this may fail
-          git push "https://${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" HEAD:refs/heads/${{ github.head_ref || github.ref_name }} || echo "Push failed (likely due to permission or PR from fork)."
+
+          # target branch (works for direct pushes). If running on caller workflow, github.ref_name or github.head_ref will be used.
+          TARGET_BRANCH="${GITHUB_REF##*/}"
+          # Push back (may fail for PRs from forks or if token lacks permission)
+          git push "https://${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" HEAD:refs/heads/${TARGET_BRANCH} || echo "Push failed (likely permission or PR from fork)."
