@@ -1,7 +1,7 @@
 name: Universal Pylint Code Quality Check
 
 on:
-  workflow_call:   # <-- allows other repos to call this workflow
+  workflow_call:
     inputs:
       min_score:
         description: "Minimum allowed Pylint score"
@@ -14,30 +14,92 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - name: Set up Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install pylint
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pylint
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-    - name: Run Pylint and check score
-      run: |
-        echo "Running Pylint..."
-        pylint_output=$(pylint $(git ls-files '*.py') || true)
-        echo "$pylint_output"
-        score=$(echo "$pylint_output" | grep "Your code has been rated" | awk '{print $7}' | cut -d'/' -f1)
-        echo "Detected score: $score"
-        if (( $(echo "$score < ${{ inputs.min_score }}" | bc -l) )); then
-          echo "❌ Pylint score $score < ${{ inputs.min_score }}"
-          exit 1
-        else
-          echo "✅ Pylint score OK ($score)"
-        fi
+      - name: Run Pylint and save report
+        id: run_pylint
+        run: |
+          echo "Running Pylint..."
+          # file that will contain the full report
+          REPORT_FILE="pylint_report.txt"
+          # run pylint on tracked python files, save full output
+          files=$(git ls-files '*.py' || true)
+          if [ -z "$files" ]; then
+            echo "No Python files found to lint." | tee "$REPORT_FILE"
+            echo "score=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          pylint $files | tee "$REPORT_FILE" || true
+
+          # append metadata
+          echo "" >> "$REPORT_FILE"
+          echo "--------------------------------------" >> "$REPORT_FILE"
+          echo "Report generated on: $(date --utc)" >> "$REPORT_FILE"
+
+          # parse the final score
+          score_line=$(grep -E "Your code has been rated" "$REPORT_FILE" || true)
+          if [ -n "$score_line" ]; then
+            score=$(echo "$score_line" | awk '{print $7}' | cut -d'/' -f1)
+          else
+            score="0"
+          fi
+          echo "Detected score: $score"
+          echo "score=$score" >> $GITHUB_OUTPUT
+
+          # prepare a Shields-compatible JSON for dynamic badge
+          # schemaVersion 1, label "Pylint", message "<score>/10"
+          jq -n --arg m "Pylint" --arg msg "${score}/10" '{schemaVersion:1, label:$m, message:$msg, color:"brightgreen"}' > pylint_score.json
+
+          # append score to report
+          echo "Score: $score" >> "$REPORT_FILE"
+
+          # fail if below threshold
+          if (( $(echo "$score < ${{ inputs.min_score }}" | bc -l) )); then
+            echo "❌ Pylint score $score < ${{ inputs.min_score }}" | tee -a "$REPORT_FILE"
+            # still upload the report but exit non-zero to mark workflow failed
+            exit 1
+          else
+            echo "✅ Pylint score OK ($score)" | tee -a "$REPORT_FILE"
+          fi
+
+      - name: Upload report as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pylint-report
+          path: |
+            pylint_report.txt
+            pylint_score.json
+
+      - name: Commit pylint_score.json back to repository (optional)
+        # this will only succeed if the runner has write permission (see caller workflow permissions)
+        run: |
+          # configure git user for commits
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # add or update pylint_score.json
+          if git ls-files --error-unmatch pylint_score.json > /dev/null 2>&1; then
+            git add pylint_score.json
+          else
+            git add pylint_score.json
+          fi
+
+          # commit (if no changes, commit exits non-zero; ignore that)
+          git commit -m "chore(ci): update pylint_score.json [skip ci]" || echo "No changes to commit"
+          # push back to the same branch; if GITHUB_TOKEN lacks rights or it's a PR from fork, this may fail
+          git push "https://${GITHUB_ACTOR}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" HEAD:refs/heads/${{ github.head_ref || github.ref_name }} || echo "Push failed (likely due to permission or PR from fork)."
